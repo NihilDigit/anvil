@@ -1,0 +1,267 @@
+[workspace]
+name = "anvil-repro"
+channels = ["conda-forge", {channel = "pytorch", priority = -1}, {channel = "nvidia", priority = -2}]
+platforms = ["linux-64"]
+
+[system-requirements]
+cuda = "12"
+
+[dependencies]
+python = ">=3.12,<3.15"
+pytorch-gpu = "*"
+torchvision = "*"
+numpy = "*"
+scipy = "*"
+opencv = "*"
+pillow = "*"
+scikit-image = "*"
+tqdm = "*"
+pandas = "*"
+ffmpeg = "*"
+onnx = ">=1.20.0,<2"
+onnxruntime = ">=1.24.2,<2"
+matplotlib = ">=3.10,<4"
+scienceplots = ">=2.2,<3"
+pyyaml = ">=6,<7"
+onnxscript = ">=0.5,<0.6"
+
+[pypi-dependencies]
+lpips = "*"
+motion-vector-extractor = "*"
+onnxsim = "*"
+huggingface-hub = "*"
+
+[tasks]
+# Pretrained weights
+download-weights = "huggingface-cli download NihilDigit/anvil --local-dir artifacts"
+
+# Data preparation
+download-vimeo = "python -m anvil_exp01.data.download_vimeo90k --output-dir data/vimeo_triplet"
+download-xiph = "python -m anvil_exp01.data.download_xiph --data-dir data/xiph_1080p"
+extract-mv = "python -m anvil_exp01.data.extract_mv --data-dir data/vimeo_triplet"
+mv-to-dense = "python -m anvil_exp01.data.mv_to_dense --mv-dir data/vimeo_triplet/mv_cache --output-dir data/vimeo_triplet/dense_flow"
+prealign-v1 = "python -m anvil_exp01.data.prealign --data-dir data/vimeo_triplet --flow-dir data/vimeo_triplet/dense_flow --output-dir data/vimeo_triplet/prealigned"
+prealign-v2 = "bash scripts/prealign_v2.sh"
+
+# Training
+train-anvil-s = "bash scripts/train_v3b.sh D-unet-v3bs-nomv"
+train-anvil-m = "bash scripts/train_v3b.sh D-unet-v3bm-nomv"
+train-capacity-sweep = "bash scripts/train_capacity_sweep.sh"
+
+# Export
+export-onnx = "bash scripts/export_onnx.sh"
+
+# =========================================================================
+# One-click paper table reproduction
+# Usage: pixi run reproduce-<table-name>
+# =========================================================================
+
+# Table main_quality — ANVIL-S/M + NAFNet-ceiling + baselines + RIFE
+reproduce-main-quality = """bash -c '\
+  set -e; \
+  for m in D-unet-v3bs-nomv D-unet-v3bm-nomv D-nafnet-nomv; do \
+    echo "=== $m on Vimeo90K ==="; \
+    python scripts/eval_vimeo.py --model $m \
+      --checkpoint artifacts/checkpoints/$m/best.pt \
+      --data-dir data/vimeo_triplet \
+      --prealigned-dir data/vimeo_triplet/prealigned_v2 \
+      --output-dir artifacts/eval/vimeo/$m; \
+    echo "=== $m on Xiph 1080p ==="; \
+    python scripts/eval_xiph.py --model $m \
+      --checkpoint artifacts/checkpoints/$m/best.pt \
+      --data-dir data/xiph_1080p \
+      --prealigned-dir data/xiph_1080p/prealigned_v2 \
+      --output-dir artifacts/eval/xiph/$m; \
+  done; \
+  echo "=== Baselines ==="; \
+  python scripts/eval_baselines.py --output-dir artifacts/eval/baselines; \
+  echo "=== RIFE HDv3 native ==="; \
+  python scripts/eval_rife_native.py \
+    --rife-repo vendor/ECCV2022-RIFE \
+    --data-dir data/vimeo_triplet \
+    --xiph-dir data/xiph_1080p \
+    --output-dir artifacts/eval/rife_native; \
+  echo "Done: artifacts/eval/{vimeo,xiph,baselines,rife_native}/"'"""
+
+# Table rife_reduced — RIFE 360p/480p ORT INT8
+reproduce-rife-reduced = """bash -c '\
+  set -e; \
+  echo "=== Export RIFE ONNX ==="; \
+  python scripts/export_rife_onnx.py \
+    --rife-repo vendor/ECCV2022-RIFE \
+    --weights vendor/ECCV2022-RIFE/train_log/flownet.pkl \
+    --output-dir artifacts/onnx/rife; \
+  echo "=== ORT INT8 eval ==="; \
+  python scripts/eval_rife_reduced_res.py \
+    --onnx-dir artifacts/onnx/rife \
+    --xiph-dir data/xiph_1080p \
+    --output-dir artifacts/eval/rife_reduced; \
+  echo "Done: artifacts/eval/rife_reduced/"'"""
+
+# Table int8_quality — Cross-method INT8 comparison
+reproduce-int8-quality = """bash -c '\
+  set -e; \
+  echo "=== Export RIFE flow ONNX ==="; \
+  python scripts/export_rife_onnx.py \
+    --rife-repo vendor/ECCV2022-RIFE \
+    --weights vendor/ECCV2022-RIFE/train_log/flownet.pkl \
+    --output-dir artifacts/onnx/int8_cross \
+    --resolutions 360p \
+    --modes flow; \
+  echo "=== Export IFRNet ONNX ==="; \
+  python scripts/export_ifrnet_onnx.py \
+    --amt-repo vendor/AMT \
+    --weights vendor/IFRNet_Vimeo90K.pth \
+    --output-dir artifacts/onnx/int8_cross; \
+  echo "=== ORT INT8 eval ==="; \
+  python scripts/eval_int8_cross_method.py \
+    --onnx-dir artifacts/onnx/int8_cross \
+    --xiph-dir data/xiph_1080p \
+    --prealigned-dir data/xiph_1080p/prealigned_v2 \
+    --anvil-s-ckpt artifacts/checkpoints/D-unet-v3bs-nomv/best.pt \
+    --anvil-m-ckpt artifacts/checkpoints/D-unet-v3bm-nomv/best.pt \
+    --output-dir artifacts/eval/int8_cross_method; \
+  echo "Done: artifacts/eval/int8_cross_method/"'"""
+
+# Table instrumented — Per-operator CosSim analysis
+reproduce-instrumented = """bash -c '\
+  set -e; \
+  echo "=== Export RIFE flow ONNX ==="; \
+  python scripts/export_rife_onnx.py \
+    --rife-repo vendor/ECCV2022-RIFE \
+    --weights vendor/ECCV2022-RIFE/train_log/flownet.pkl \
+    --output-dir artifacts/onnx/int8_instrumented \
+    --resolutions 360p \
+    --modes flow; \
+  echo "=== Export IFRNet flow ONNX ==="; \
+  python scripts/export_ifrnet_onnx.py \
+    --amt-repo vendor/AMT \
+    --weights vendor/IFRNet_Vimeo90K.pth \
+    --output-dir artifacts/onnx/int8_instrumented \
+    --modes flow; \
+  echo "=== Instrumented INT8 eval ==="; \
+  python scripts/eval_int8_instrumented.py \
+    --onnx-dir artifacts/onnx/int8_instrumented \
+    --xiph-dir data/xiph_1080p \
+    --models rife_flow_360p ifrnet_flow \
+    --output-dir artifacts/eval/int8_instrumented; \
+  echo "Done: artifacts/eval/int8_instrumented/"'"""
+
+# Table ablation_capacity — 5-model capacity sweep
+reproduce-ablation = """bash -c '\
+  set -e; \
+  echo "=== Capacity sweep eval ==="; \
+  for m in D-tiny-nomv D-mini-nomv D-mid-nomv D-unet-s-nomv D-unet-l-nomv; do \
+    echo "--- $m ---"; \
+    python scripts/eval_vimeo.py --model $m \
+      --checkpoint artifacts/checkpoints_capacity/$m/best.pt \
+      --data-dir data/vimeo_triplet \
+      --prealigned-dir data/vimeo_triplet/prealigned \
+      --output-dir artifacts/eval/capacity_sweep/$m; \
+  done; \
+  echo "Done: artifacts/eval/capacity_sweep/"'"""
+
+# Deploy-time fusion verification
+reproduce-deploy-fusion = """bash -c '\
+  set -e; \
+  for m in D-unet-v3bs-nomv D-unet-v3bm-nomv; do \
+    echo "=== $m ==="; \
+    python scripts/eval_deploy_fusion.py --model $m \
+      --checkpoint artifacts/checkpoints/$m/best.pt \
+      --output-dir artifacts/eval/deploy_fusion/$m; \
+  done; \
+  echo "Done: artifacts/eval/deploy_fusion/"'"""
+
+# Temporal consistency (tOF / WE)
+reproduce-temporal = """python scripts/eval_temporal_consistency.py \
+  --xiph-dir data/xiph_1080p \
+  --anvil-s-ckpt artifacts/checkpoints/D-unet-v3bs-nomv/best.pt \
+  --anvil-m-ckpt artifacts/checkpoints/D-unet-v3bm-nomv/best.pt \
+  --rife-repo vendor/ECCV2022-RIFE \
+  --output-dir artifacts/eval/temporal_consistency"""
+
+# Figure 6 — visual comparison
+reproduce-fig-visual = """python scripts/gen_fig_visual_comparison.py \
+  --xiph-dir data/xiph_1080p \
+  --anvil-ckpt artifacts/checkpoints/D-unet-v3bm-nomv/best.pt \
+  --rife-repo vendor/ECCV2022-RIFE \
+  --output-dir artifacts/figures"""
+
+# Prealign method ablation (6 methods, full test set)
+reproduce-prealign-ablation = """python scripts/eval_prealign_ablation.py \
+  --data-dir data/vimeo_triplet \
+  --mv-dir data/vimeo_triplet/mv_cache \
+  --output-dir artifacts/eval/prealign_ablation"""
+
+# Prealign v2 improvement (+1.28 dB)
+reproduce-prealign-v2 = """bash -c '\
+  set -e; \
+  echo "=== MV Blend (smoothed prealignment) ==="; \
+  python scripts/eval_baselines.py --dataset vimeo --methods mv_blend_v2 \
+    --output-dir artifacts/eval/baselines_v2 --force; \
+  echo "=== MV Blend (basic prealignment) ==="; \
+  python scripts/eval_baselines.py --dataset vimeo --methods mv_blend \
+    --prealigned-v1-vimeo data/vimeo_triplet/prealigned \
+    --output-dir artifacts/eval/baselines_v1 --force; \
+  echo "Done: compare baselines_v1/ vs baselines_v2/"'"""
+
+# Codec robustness sweep (Discussion section)
+reproduce-codec-robustness = """python scripts/eval_codec_robustness.py \
+  --xiph-dir data/xiph_1080p \
+  --output-dir artifacts/eval/codec_robustness \
+  --full"""
+
+# ALL offline tables (no device needed) — full reproduction
+reproduce-all-offline = """bash -c '\
+  set -e; \
+  echo "========================================"; \
+  echo "  ANVIL Full Offline Reproduction"; \
+  echo "========================================"; \
+  pixi run reproduce-main-quality; \
+  pixi run reproduce-rife-reduced; \
+  pixi run reproduce-int8-quality; \
+  pixi run reproduce-instrumented; \
+  pixi run reproduce-ablation; \
+  pixi run reproduce-prealign-v2; \
+  pixi run reproduce-deploy-fusion; \
+  pixi run reproduce-temporal; \
+  pixi run reproduce-fig-visual; \
+  echo "========================================"; \
+  echo "  All offline tables reproduced."; \
+  echo "  Results: artifacts/eval/"; \
+  echo "========================================"'"""
+
+# =========================================================================
+# Device-dependent (require QAIRT SDK + Android device)
+# Set QAIRT_SDK_ROOT before running
+# =========================================================================
+
+# Table latency — HTP FP16/INT8 benchmark
+# Prerequisites: ONNX models + calibration data (auto-generated if missing)
+reproduce-latency = """bash -c '\
+  set -e; \
+  echo "=== Step 1: Export ONNX (if needed) ==="; \
+  bash scripts/export_onnx.sh; \
+  echo "=== Step 2: Generate calibration data (if needed) ==="; \
+  if [ ! -d artifacts/calib/anvil_s_1080p ]; then \
+    python -m anvil_exp01.gen_calibration_data \
+      --out-dir artifacts/calib/anvil_s_1080p \
+      --n-samples 100 --resolution 1080p; \
+  fi; \
+  echo "=== Step 3: HTP latency benchmark ==="; \
+  python scripts/bench_htp_latency.py \
+    --onnx-dir artifacts/onnx \
+    --calib-dir artifacts/calib/anvil_s_1080p \
+    --qairt-root ${QAIRT_SDK_ROOT:-/opt/qcom/aistack/qairt/2.42.0.251225} \
+    --output-dir artifacts/eval/latency; \
+  echo "Done: artifacts/eval/latency/"'"""
+
+# Table operator_compat — HTP column
+reproduce-operator-compat = """python scripts/bench_operators.py \
+  --qairt-root ${QAIRT_SDK_ROOT:-/opt/qcom/aistack/qairt/2.42.0.251225} \
+  --output-dir artifacts/eval/operator_compat"""
+
+# =========================================================================
+# Utilities
+# =========================================================================
+smoke-test = "bash scripts/smoke_test.sh"
